@@ -31,45 +31,63 @@ ADV_MAX_HEIGHT = 100.0
 print("Initializing FastAPI Server...")
 device = torch.device('cpu')
 
-# Create empty models globally so the routes can see them
+# Create empty models globally
 basic_model = WinningFusionUNet().to(device)
 advanced_model = FusionHeightNet().to(device)
 
-@app.on_event("startup")
-async def load_models():
-    """This runs AFTER the server binds to the port, preventing Render timeouts!"""
+# --- NEW: Global flag to track when downloads finish ---
+MODELS_READY = False
+
+def background_model_loader():
+    """Runs in a separate thread so the server doesn't freeze during startup!"""
+    global MODELS_READY
     import os
     import urllib.request
     
-    print("Server online! Now downloading and loading heavy AI models...")
-    
-    # --- UPDATE YOUR GITHUB RELEASE URLs HERE ---
+    print("⬇️ Background thread started: Downloading models...")
     ADVANCED_MODEL_URL = "https://github.com/Thrivikramteja/Cosmix-2026/releases/download/v1.0/fusion_height_net_best.pth"
     BASIC_MODEL_URL = "https://github.com/Thrivikramteja/Cosmix-2026/releases/download/v1.0/basic_model.pth"
     
-    # 1. Download & Load Advanced Model
-    if not os.path.exists("fusion_height_net_best.pth"):
-        print("Downloading Advanced Model...")
-        urllib.request.urlretrieve(ADVANCED_MODEL_URL, "fusion_height_net_best.pth")
-        
-    print("Loading Advanced Model into Memory...")
-    adv_checkpoint = torch.load("fusion_height_net_best.pth", map_location=device) 
-    advanced_model.load_state_dict(adv_checkpoint['model_state_dict'] if 'model_state_dict' in adv_checkpoint else adv_checkpoint)
-    advanced_model.eval()
-    print(" Advanced Model Ready!")
+    try:
+        # 1. Download & Load Advanced Model
+        if not os.path.exists("fusion_height_net_best.pth"):
+            urllib.request.urlretrieve(ADVANCED_MODEL_URL, "fusion_height_net_best.pth")
+            
+        print("🧠 Loading Advanced Model into Memory...")
+        adv_checkpoint = torch.load("fusion_height_net_best.pth", map_location=device) 
+        advanced_model.load_state_dict(adv_checkpoint['model_state_dict'] if 'model_state_dict' in adv_checkpoint else adv_checkpoint)
+        advanced_model.eval()
 
-    # 2. Download & Load Basic Model
-    if not os.path.exists("basic_model.pth"):
-        print("Downloading Basic Model...")
-        urllib.request.urlretrieve(BASIC_MODEL_URL, "basic_model.pth")
+        # 2. Download & Load Basic Model
+        if not os.path.exists("basic_model.pth"):
+            urllib.request.urlretrieve(BASIC_MODEL_URL, "basic_model.pth")
+            
+        print("🧠 Loading Basic Model into Memory...")
+        basic_checkpoint = torch.load("basic_model.pth", map_location=device)
+        basic_model.load_state_dict(basic_checkpoint['model_state_dict'] if 'model_state_dict' in basic_checkpoint else basic_checkpoint)
+        basic_model.eval()
         
-    print("Loading Basic Model into Memory...")
-    basic_checkpoint = torch.load("basic_model.pth", map_location=device)
-    basic_model.load_state_dict(basic_checkpoint['model_state_dict'] if 'model_state_dict' in basic_checkpoint else basic_checkpoint)
-    basic_model.eval()
-    print(" Basic Model Ready!")
-    
-    print(" API IS FULLY OPERATIONAL!")
+        MODELS_READY = True
+        print("✅ ALL MODELS FULLY LOADED AND READY!")
+    except Exception as e:
+        print(f"❌ Background Loader Error: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    import asyncio
+    print("🚀 Server online and port opened! Spawning background loader...")
+    loop = asyncio.get_event_loop()
+    # Run the heavy loading safely in the background
+    loop.run_in_executor(None, background_model_loader)
+
+# --- NEW: Status Dashboard Route ---
+@app.get("/")
+async def root():
+    """Visit your Render URL in the browser to check this!"""
+    if MODELS_READY:
+        return {"status": "🟢 ONLINE", "message": "Models are loaded and ready for predictions!"}
+    else:
+        return {"status": "🟡 BOOTING", "message": "Server is up! Models are currently downloading in the background. Please wait ~60 seconds..."}
 
 
 # ==========================================
