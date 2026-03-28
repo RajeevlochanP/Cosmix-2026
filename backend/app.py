@@ -28,22 +28,48 @@ app.add_middleware(
 BASIC_MAX_HEIGHT = 50.0  
 ADV_MAX_HEIGHT = 100.0   
 
-print("Loading AI Models onto CPU...")
+print("Initializing FastAPI Server...")
 device = torch.device('cpu')
 
-# 1. Load Basic Model
+# Create empty models globally so the routes can see them
 basic_model = WinningFusionUNet().to(device)
-basic_checkpoint = torch.load("basic_model.pth", map_location=device) # UPDATE FILENAME
-basic_model.load_state_dict(basic_checkpoint['model_state_dict'] if 'model_state_dict' in basic_checkpoint else basic_checkpoint)
-basic_model.eval()
-
-# 2. Load Advanced Model
 advanced_model = FusionHeightNet().to(device)
-adv_checkpoint = torch.load("fusion_height_net_best.pth", map_location=device) # UPDATE FILENAME
-advanced_model.load_state_dict(adv_checkpoint['model_state_dict'] if 'model_state_dict' in adv_checkpoint else adv_checkpoint)
-advanced_model.eval()
 
-print("Both Models Ready!")
+@app.on_event("startup")
+async def load_models():
+    """This runs AFTER the server binds to the port, preventing Render timeouts!"""
+    import os
+    import urllib.request
+    
+    print("Server online! Now downloading and loading heavy AI models...")
+    
+    # --- UPDATE YOUR GITHUB RELEASE URLs HERE ---
+    ADVANCED_MODEL_URL = "https://github.com/Thrivikramteja/Cosmix-2026/releases/download/v1.0/fusion_height_net_best.pth"
+    BASIC_MODEL_URL = "https://github.com/Thrivikramteja/Cosmix-2026/releases/download/v1.0/basic_model.pth"
+    
+    # 1. Download & Load Advanced Model
+    if not os.path.exists("fusion_height_net_best.pth"):
+        print("Downloading Advanced Model...")
+        urllib.request.urlretrieve(ADVANCED_MODEL_URL, "fusion_height_net_best.pth")
+        
+    print("Loading Advanced Model into Memory...")
+    adv_checkpoint = torch.load("fusion_height_net_best.pth", map_location=device) 
+    advanced_model.load_state_dict(adv_checkpoint['model_state_dict'] if 'model_state_dict' in adv_checkpoint else adv_checkpoint)
+    advanced_model.eval()
+    print(" Advanced Model Ready!")
+
+    # 2. Download & Load Basic Model
+    if not os.path.exists("basic_model.pth"):
+        print("Downloading Basic Model...")
+        urllib.request.urlretrieve(BASIC_MODEL_URL, "basic_model.pth")
+        
+    print("Loading Basic Model into Memory...")
+    basic_checkpoint = torch.load("basic_model.pth", map_location=device)
+    basic_model.load_state_dict(basic_checkpoint['model_state_dict'] if 'model_state_dict' in basic_checkpoint else basic_checkpoint)
+    basic_model.eval()
+    print(" Basic Model Ready!")
+    
+    print(" API IS FULLY OPERATIONAL!")
 
 
 # ==========================================
