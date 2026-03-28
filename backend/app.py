@@ -10,6 +10,10 @@ import tifffile
 import pandas as pd
 from shapely import wkt
 import scipy.ndimage as ndimage
+import gc # <-- NEW: Garbage Collector to save RAM
+import os
+import urllib.request
+import asyncio
 
 # Import your model architectures
 from model_architecture import WinningFusionUNet, FusionHeightNet
@@ -28,66 +32,47 @@ app.add_middleware(
 BASIC_MAX_HEIGHT = 50.0  
 ADV_MAX_HEIGHT = 100.0   
 
+# --- CRITICAL RENDER RAM SAVER ---
+# Forces PyTorch to use only 1 CPU core, massively dropping memory overhead
+torch.set_num_threads(1) 
+
 print("Initializing FastAPI Server...")
 device = torch.device('cpu')
 
-# Create empty models globally
-basic_model = WinningFusionUNet().to(device)
-advanced_model = FusionHeightNet().to(device)
+# Global flag to track downloads
+MODELS_DOWNLOADED = False
 
-# --- NEW: Global flag to track when downloads finish ---
-MODELS_READY = False
-
-def background_model_loader():
-    """Runs in a separate thread so the server doesn't freeze during startup!"""
-    global MODELS_READY
-    import os
-    import urllib.request
-    
-    print("⬇️ Background thread started: Downloading models...")
+def background_downloader():
+    """Only DOWNLOADS the files to the hard drive. Does NOT load them into RAM yet!"""
+    global MODELS_DOWNLOADED
+    print("⬇️ Background thread started: Downloading models to disk...")
     ADVANCED_MODEL_URL = "https://github.com/Thrivikramteja/Cosmix-2026/releases/download/v1.0/fusion_height_net_best.pth"
     BASIC_MODEL_URL = "https://github.com/Thrivikramteja/Cosmix-2026/releases/download/v1.0/basic_model.pth"
     
     try:
-        # 1. Download & Load Advanced Model
         if not os.path.exists("fusion_height_net_best.pth"):
             urllib.request.urlretrieve(ADVANCED_MODEL_URL, "fusion_height_net_best.pth")
             
-        print("🧠 Loading Advanced Model into Memory...")
-        adv_checkpoint = torch.load("fusion_height_net_best.pth", map_location=device) 
-        advanced_model.load_state_dict(adv_checkpoint['model_state_dict'] if 'model_state_dict' in adv_checkpoint else adv_checkpoint)
-        advanced_model.eval()
-
-        # 2. Download & Load Basic Model
         if not os.path.exists("basic_model.pth"):
             urllib.request.urlretrieve(BASIC_MODEL_URL, "basic_model.pth")
             
-        print("🧠 Loading Basic Model into Memory...")
-        basic_checkpoint = torch.load("basic_model.pth", map_location=device)
-        basic_model.load_state_dict(basic_checkpoint['model_state_dict'] if 'model_state_dict' in basic_checkpoint else basic_checkpoint)
-        basic_model.eval()
-        
-        MODELS_READY = True
-        print("✅ ALL MODELS FULLY LOADED AND READY!")
+        MODELS_DOWNLOADED = True
+        print("✅ ALL MODELS SECURELY DOWNLOADED TO DISK!")
     except Exception as e:
         print(f"❌ Background Loader Error: {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    import asyncio
-    print("🚀 Server online and port opened! Spawning background loader...")
+    print("🚀 Server online! Spawning background downloader...")
     loop = asyncio.get_event_loop()
-    # Run the heavy loading safely in the background
-    loop.run_in_executor(None, background_model_loader)
+    loop.run_in_executor(None, background_downloader)
 
-# --- NEW: Status Dashboard Route ---
 @app.get("/")
 async def root():
-    """Visit your Render URL in the browser to check this!"""
-    if MODELS_READY:
-        return {"status": "🟢 ONLINE", "message": "Models are loaded and ready for predictions!"}
+    if MODELS_DOWNLOADED:
+        return {"status": "🟢 ONLINE", "message": "API ready. Models will Lazy-Load on request to save RAM."}
     else:
-        return {"status": "🟡 BOOTING", "message": "Server is up! Models are currently downloading in the background. Please wait ~60 seconds..."}
+        return {"status": "🟡 BOOTING", "message": "Downloading model files to disk..."}
 
 
 # ==========================================
@@ -247,12 +232,17 @@ async def predict_basic(
     csv_file: UploadFile = File(...)
 ):
     try:
+        # 1. Check if background download is finished
+        if not MODELS_DOWNLOADED:
+            raise HTTPException(status_code=503, detail="Models are still downloading to the server. Please wait a few seconds and try again.")
+
+        # 2. Read Files
         opt_bytes, sar_bytes, csv_bytes = await optical_file.read(), await sar_file.read(), await csv_file.read()
 
-        # Parse Ground Truth
+        # 3. Parse Ground Truth
         gt_mask_np, gt_height_np = generate_gt_masks(csv_bytes, image_id)
 
-        # Load and reshape TIFFs
+        # 4. Process TIFFs
         opt_array = tifffile.imread(io.BytesIO(opt_bytes))
         if len(opt_array.shape) == 3 and opt_array.shape[0] < opt_array.shape[2]: opt_array = np.transpose(opt_array, (1, 2, 0))
         opt_array = cv2.resize(opt_array, (512, 512)).astype(np.float32) / (65535.0 if opt_array.max() > 255 else 255.0)
@@ -261,20 +251,38 @@ async def predict_basic(
         if len(sar_array.shape) == 3 and sar_array.shape[0] < sar_array.shape[2]: sar_array = np.transpose(sar_array, (1, 2, 0))
         sar_array = cv2.resize(sar_array, (512, 512)).astype(np.float32) / (sar_array.max() if sar_array.max() > 0 else 1.0)
         
+        # Combine to 7 channels for Basic Model
         combined_input = np.concatenate([opt_array, sar_array], axis=-1)
         input_tensor = torch.tensor(combined_input).permute(2, 0, 1).unsqueeze(0).to(device)
 
+        # --- LAZY LOAD: ONLY LOAD INTO RAM WHEN NEEDED ---
+        print("🧠 Loading Basic Model into RAM temporarily...")
+        basic_model = WinningFusionUNet().to(device)
+        basic_checkpoint = torch.load("basic_model.pth", map_location=device)
+        basic_model.load_state_dict(basic_checkpoint['model_state_dict'] if 'model_state_dict' in basic_checkpoint else basic_checkpoint)
+        basic_model.eval()
+
+        # 5. Run Inference
         with torch.no_grad():
             pred_footprint, pred_height = basic_model(input_tensor)
         
+        # Post-Processing
         pred_prob_np = pred_footprint.squeeze().cpu().numpy()
         pred_height_np = (pred_height.squeeze().cpu().numpy()) * BASIC_MAX_HEIGHT
 
+        # --- MEMORY WIPE: DELETE MODEL AND FREE RAM IMMEDIATELY ---
+        del basic_model
+        del basic_checkpoint
+        gc.collect()
+        print("🧹 Basic Model wiped from RAM to prevent Render crash.")
+
+        # 6. Generate Frontend Payload
         return generate_frontend_payload(opt_array, pred_prob_np, pred_height_np, gt_mask_np, gt_height_np)
 
     except Exception as e:
+        import traceback
+        traceback.print_exc() # Prints the exact error line in Render logs
         raise HTTPException(status_code=400, detail=str(e))
-
 
 # ==========================================
 # ROUTE 2: ADVANCED CROSS-ATTENTION MODEL
@@ -287,11 +295,14 @@ async def predict_advanced(
     csv_file: UploadFile = File(...)
 ):
     try:
+        if not MODELS_DOWNLOADED:
+            raise HTTPException(status_code=503, detail="Models are still downloading. Please try again in 30 seconds.")
+
         opt_bytes, sar_bytes, csv_bytes = await optical_file.read(), await sar_file.read(), await csv_file.read()
 
-        # Parse Ground Truth
         gt_mask_np, gt_height_np = generate_gt_masks(csv_bytes, image_id)
 
+        # Process TIFFs
         opt_array = tifffile.imread(io.BytesIO(opt_bytes))
         if len(opt_array.shape) == 3 and opt_array.shape[0] < opt_array.shape[2]: opt_array = np.transpose(opt_array, (1, 2, 0))
         opt_array = cv2.resize(opt_array, (512, 512))
@@ -310,12 +321,25 @@ async def predict_advanced(
         opt_tensor = torch.tensor(opt_array_3ch).permute(2, 0, 1).unsqueeze(0).to(device)
         sar_tensor = torch.tensor(sar_array_3ch).permute(2, 0, 1).unsqueeze(0).to(device)
 
+        # --- LAZY LOAD: ONLY LOAD INTO RAM WHEN NEEDED ---
+        print("Loading Advanced Model into RAM temporarily...")
+        advanced_model = FusionHeightNet().to(device)
+        adv_checkpoint = torch.load("fusion_height_net_best.pth", map_location=device)
+        advanced_model.load_state_dict(adv_checkpoint['model_state_dict'] if 'model_state_dict' in adv_checkpoint else adv_checkpoint)
+        advanced_model.eval()
+
         with torch.no_grad():
             pred_foot, pred_height = advanced_model(opt_tensor, sar_tensor)
             
         pred_prob_np = F.softmax(pred_foot, dim=1)[0, 1, :, :].cpu().numpy()
         pred_norm = pred_height[0, 0, :, :].cpu().numpy()
         pred_height_np = np.expm1(pred_norm * np.log1p(ADV_MAX_HEIGHT))
+
+        # --- MEMORY WIPE: DELETE MODEL AND FREE RAM IMMEDIATELY ---
+        del advanced_model
+        del adv_checkpoint
+        gc.collect()
+        print("Model deleted from RAM to prevent crash.")
 
         return generate_frontend_payload(opt_array_3ch, pred_prob_np, pred_height_np, gt_mask_np, gt_height_np)
 
